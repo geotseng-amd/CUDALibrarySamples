@@ -27,6 +27,9 @@
  */
 
 #include <cublasLt.h>
+// include bf16 and fp16 libraries
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 /// Sample wrapper executing single precision gemm algorithm auto tuning by querying cublasLt heuristics for best algorithms,
 /// iterate over the results and pick the algorithm that have the best performance for the given problem
@@ -34,20 +37,48 @@
 /// pointer mode is always host, to change it configure the appropriate matmul descriptor attribute
 /// matmul is not using cublas handle's configuration of math mode, here tensor ops are implicitly allowed; to change
 /// this configure appropriate attribute in the preference handle
+//template <typename __nv_bfloat16, typename __nv_bfloat16/* = __nv_bfloat16*/, typename float/*= OutType*/>
+//void LtSgemmSimpleAutoTuning(cublasLtHandle_t ltHandle,
+//                             cublasOperation_t transa,
+//                             cublasOperation_t transb,
+//                             int m,
+//                             int n,
+//                             int k,
+//                             const __nv_bfloat16 *alpha, /* host pointer */
+//                             const __nv_bfloat16 *A,
+//                             int lda,
+//                             const __nv_bfloat16 *B,
+//                             int ldb,
+//                             const __nv_bfloat16 *beta, /* host pointer */
+//                             __nv_bfloat16 *C,
+//                             int ldc,
+//                             void *workspace,
+//                             size_t workspaceSize,
+//                             cublasLtMatmulAlgo_t& algo,
+//							 const int requested_num,
+//							 const int num_cold_iters,
+//							 const int num_hot_iters);
+//
+
 void LtSgemmSimpleAutoTuning(cublasLtHandle_t ltHandle,
                              cublasOperation_t transa,
                              cublasOperation_t transb,
-                             int m,
-                             int n,
-                             int k,
+                             size_t m,
+                             size_t n,
+                             size_t k,
                              const float *alpha, /* host pointer */
-                             const float *A,
-                             int lda,
-                             const float *B,
-                             int ldb,
+                             const __nv_half *A,/*__nv_bfloat16*/
+                             size_t lda,
+                             const __nv_half *B,/*__nv_bfloat16*/
+                             size_t ldb,
                              const float *beta, /* host pointer */
-                             float *C,
-                             int ldc,
+                             __nv_half *C,/*__nv_bfloat16*/
+                             size_t ldc,
+                             const __nv_half *biasDev,/*__nv_bfloat16*/
+                             const float *alphaVecDev, /* add device alpha vector */
                              void *workspace,
                              size_t workspaceSize,
-                             cublasLtMatmulAlgo_t& algo);
+                             cublasLtMatmulAlgo_t& algo,
+                             const int requested_num,
+                             const int num_cold_iters,
+                             const int num_hot_iters);
