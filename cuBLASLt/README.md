@@ -66,4 +66,33 @@ x86_64
         cmake .. -DCMAKE_BUILD_TYPE=Release
         make -j
 
+## Benchmark Steps
+        cd build
+        bash bench.sh
+## Benchmark script (bench.sh)
+        #!/bin/bash
+
+        # Put bench.sh inside build/
+        # Codebase parameters
+        CUBLASLT_LOG_LEVEL_FLAG=5
+
+        # Environment parameters
+        sel=1000
+        warm=100
+        iter=1000
+
+        # Bench problems
+        # size 0
+        # Todo modify for F16:A/B, F32:C/D
+        M=128
+        N=16
+        K=5280
+        TRANS_A=N
+        TRANS_B=N
+        BIAS_VEC=true
+        ALPHA_VEC=false
+
+        if $BIAS_VEC; then BIAS_VEC_STR="_bias"; else BIAS_VEC_STR=""; fi
+        printf "BENCH: 0_cu_ps"$M"_"$N"_"$K$BIAS_VEC_STR"_sel"$sel"\n"
+        CUBLASLT_LOG_LEVEL=$CUBLASLT_LOG_LEVEL_FLAG ./LtSgemmSimpleAutoTuning/sample_cublasLt_LtSgemmSimpleAutoTuning $M $N $K $TRANS_A $TRANS_B $sel $warm $iter $BIAS_VEC $ALPHA_VEC| tee "0_cu_ps"$M"_"$N"_"$K$BIAS_VEC_STR"_sel"$sel".txt"
 On Windows, instead of running the last build step, open the Visual Studio Solution that was created and build.

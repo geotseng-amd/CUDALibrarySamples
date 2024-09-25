@@ -55,18 +55,22 @@ template <typename InType, typename OutType = InType, typename ComputeType = Out
 struct TestBench {
     using SampleRunner = std::function<void()>;
 
-    TestBench(int m, int n, int k,
-            ComputeType alpha = ComputeType{0.0f}, ComputeType beta = ComputeType{0.0f},
-            size_t workspaceSize = 1024 * 1024 * 4, int N = 1,
-            ComputeType Ascale = ComputeType{2.0f}, ComputeType Bscale = ComputeType{0.5f},
-            ComputeType Cscale = ComputeType{1.0f}, ComputeType Dscale = ComputeType{1.0f}) :
+    TestBench(size_t m, size_t n, size_t k, cublasOperation_t transa = CUBLAS_OP_T, cublasOperation_t transb = CUBLAS_OP_N, bool bias_vec=true, bool alpha_vec=true,
+            ComputeType alpha = ComputeType{1}, ComputeType beta = ComputeType{1},
+            size_t workspaceSize = 0/*1024 * 1024 * 32 or 4*/, size_t N = 1,
+            ComputeType Ascale = ComputeType{1}, ComputeType Bscale = ComputeType{1/*0.5*/},
+            ComputeType Cscale = ComputeType{1}, ComputeType Dscale = ComputeType{1}) :
         m(m), n(n), k(k), N(N), alpha(alpha), beta(beta), workspaceSize(workspaceSize), Ahost(m * k * N), Bhost(n * k * N),
-        Chost(m * n * N), biasHost(m * N), AscaleHost(Ascale), BscaleHost(Bscale), CscaleHost(Cscale), DscaleHost(Dscale) {
+        Chost(m * n * N), biasHost(m * N), AscaleHost(Ascale), BscaleHost(Bscale), CscaleHost(Cscale), DscaleHost(Dscale),
+		transA(transa), transB(transb), bias_vec_enable(bias_vec), alpha_vec_enable(alpha_vec), alphaVecHost(m * N) {
         checkCublasStatus(cublasLtCreate(&ltHandle));
         checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&Adev), m * k * N * sizeof(InType)));
         checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&Bdev), n * k * N  * sizeof(InType)));
         checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&Cdev), m * n * N  * sizeof(OutType)));
-        checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&biasDev), m * N * sizeof(OutType)));
+        if(bias_vec_enable)
+            checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&biasDev), m * N * sizeof(OutType)));
+        if(alpha_vec_enable)
+            checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&alphaVecDev), m * N * sizeof(ComputeType)));
         checkCudaStatus(cudaMalloc(&workspace, workspaceSize));
         checkCudaStatus(cudaStreamCreate(&stream));
 
@@ -81,6 +85,12 @@ struct TestBench {
             checkCudaStatus(cudaMalloc(reinterpret_cast<void**>(&DamaxDev), sizeof(*DamaxDev)));
         }
 
+		lda = (transa == CUBLAS_OP_N) ? m : k;
+		ldb = (transb == CUBLAS_OP_N) ? k : n;
+		ldc = m;
+		ldd = m;
+		lde = m;
+
         fillData();
     }
 
@@ -89,7 +99,10 @@ struct TestBench {
         checkCudaStatus(cudaFree(Adev));
         checkCudaStatus(cudaFree(Bdev));
         checkCudaStatus(cudaFree(Cdev));
-        checkCudaStatus(cudaFree(biasDev));
+        if(bias_vec_enable)
+            checkCudaStatus(cudaFree(biasDev));
+        if(alpha_vec_enable)
+            checkCudaStatus(cudaFree(alphaVecDev));
         checkCudaStatus(cudaFree(workspace));
         if (perTensorScalingEnabled) {
             checkCudaStatus(cudaFree(AscaleDev));
@@ -101,16 +114,66 @@ struct TestBench {
         checkCudaStatus(cudaStreamDestroy(stream));
     }
 
+	template <typename T>
+	void hipblaslt_init_sin(
+	    T* A, size_t M, size_t N, size_t lda, size_t stride = 0, size_t batch_count = 1)
+	{
+	    for(size_t i_batch = 0; i_batch < batch_count; i_batch++)
+	#pragma omp parallel for
+	        for(size_t j = 0; j < N; ++j)
+	        {
+	            size_t offset = j * lda + i_batch * stride;
+	            for(size_t i = 0; i < M; ++i)
+	                A[i + offset] = static_cast<T>(sin(double(i + offset))); //force cast to double
+	        }
+	}
+
+	template <typename T>
+	void hipblaslt_init_cos(
+	    T* A, size_t M, size_t N, size_t lda, size_t stride = 0, size_t batch_count = 1)
+	{
+	    for(size_t i_batch = 0; i_batch < batch_count; i_batch++)
+	#pragma omp parallel for
+	        for(size_t j = 0; j < N; ++j)
+	        {
+	            size_t offset = j * lda + i_batch * stride;
+	            for(size_t i = 0; i < M; ++i)
+	                A[i + offset] = T(cos(double(i + offset))); //force cast to double
+	        }
+	}
+
     void fillData() {
-        for (int i = 0; i < m * k * N; i++) Ahost[i] = InType(i);
-        for (int i = 0; i < n * k * N; i++) Bhost[i] = InType(i);
-        for (int i = 0; i < m * N; i++) biasHost[i] = InType(i + 1);
+		size_t A_row = (transA == CUBLAS_OP_N) ? m : k;
+		size_t A_col = (transA == CUBLAS_OP_N) ? k : m;
+		size_t B_row = (transB == CUBLAS_OP_N) ? k : n;
+        size_t B_col = (transB == CUBLAS_OP_N) ? n : k;
+		size_t stride_a = lda * A_col;
+		size_t stride_b = ldb * B_col;
+		size_t stride_c = ldc * n;
+		size_t stride_d = ldd * n;
+		size_t stride_e = lde * n;
+		size_t sizeA = stride_a;
+		size_t sizeB = stride_b;
+		size_t sizeC = stride_c;
+		size_t sizeD = stride_d;
+		size_t sizeE = stride_e;
+
+		hipblaslt_init_sin<InType>(Ahost.data(), A_row, A_col, lda, stride_a);
+		hipblaslt_init_cos<InType>(Bhost.data(), B_row, B_col, ldb, stride_b);
+
+        // for (int i = 0; i < m * k * N; i++) Ahost[i] = InType(i);
+        // for (int i = 0; i < n * k * N; i++) Bhost[i] = InType(i);
+        for (size_t i = 0; i < m * N; i++) biasHost[i] = static_cast<InType>(float(i + 1));
+        for (size_t i = 0; i < m * N; i++) alphaVecHost[i] = static_cast<ComputeType>(float(i + 1));
     }
 
     void copyDataToDevice() {
         checkCudaStatus(cudaMemcpyAsync(Adev, Ahost.data(), Ahost.size() * sizeof(Ahost[0]), cudaMemcpyHostToDevice, stream));
         checkCudaStatus(cudaMemcpyAsync(Bdev, Bhost.data(), Bhost.size() * sizeof(Bhost[0]), cudaMemcpyHostToDevice, stream));
-        checkCudaStatus(cudaMemcpyAsync(biasDev, biasHost.data(), biasHost.size() * sizeof(biasHost[0]), cudaMemcpyHostToDevice));
+        if(bias_vec_enable)
+            checkCudaStatus(cudaMemcpyAsync(biasDev, biasHost.data(), biasHost.size() * sizeof(biasHost[0]), cudaMemcpyHostToDevice));
+        if(alpha_vec_enable)
+            checkCudaStatus(cudaMemcpyAsync(alphaVecDev, alphaVecHost.data(), alphaVecHost.size() * sizeof(alphaVecHost[0]), cudaMemcpyHostToDevice));
         if (perTensorScalingEnabled) {
             checkCudaStatus(cudaMemcpyAsync(AscaleDev, &AscaleHost, sizeof(AscaleHost), cudaMemcpyHostToDevice));
             checkCudaStatus(cudaMemcpyAsync(BscaleDev, &BscaleHost, sizeof(BscaleHost), cudaMemcpyHostToDevice));
@@ -138,18 +201,23 @@ struct TestBench {
     }
 
     bool perTensorScalingEnabled;
-    int m, n, k, N;
+    size_t m, n, k, N;
     ComputeType alpha, beta;
     size_t workspaceSize;
     std::vector<InType> Ahost, Bhost;
     std::vector<OutType> Chost, biasHost;
+    std::vector<ComputeType> alphaVecHost;
     void *workspace;
     InType *Adev, *Bdev;
-    OutType *Cdev, *biasDev;
+    OutType *Cdev, *biasDev=NULL;
+    ComputeType *alphaVecDev=NULL;
     cudaStream_t stream;
     cublasLtHandle_t ltHandle;
     ComputeType AscaleHost, BscaleHost, CscaleHost, DscaleHost, DamaxHost;
     ComputeType *AscaleDev, *BscaleDev, *CscaleDev, *DscaleDev, *DamaxDev;
+	cublasOperation_t transA, transB;
+	size_t lda, ldb, ldc, ldd, lde;
+    bool bias_vec_enable, alpha_vec_enable;
 };
 
 template <>
